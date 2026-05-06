@@ -23,31 +23,27 @@ Use this extension for long-running servers, watchers, REPLs, database CLIs, she
 
 ## Install
 
-### Marketplace install
+Clone this repository directly into OMP's user extension directory. OMP discovers extension packages one level below `~/.omp/agent/extensions/`, so no `extensions:` config entry is required when the repo is in this location.
+
+Windows PowerShell:
+
+```powershell
+git clone git@github.com:anton1615/omp-pty.git "$env:USERPROFILE\.omp\agent\extensions\omp-pty"
+```
+
+Unix-like shells:
 
 ```sh
-omp plugin marketplace add anton1615/omp-pty
-omp plugin install omp-pty@omp-pty
+git clone git@github.com:anton1615/omp-pty.git ~/.omp/agent/extensions/omp-pty
 ```
 
-Marketplace installation makes the plugin root discoverable to OMP and loads bundled skills from `skills/*/SKILL.md` on the next session/reload. The bundled PTY skill is exposed as `omp-pty:using-omp-pty`.
+Then restart or reload OMP. The expected extension entry is:
 
-Current OMP marketplace loading does not activate extension modules from marketplace-installed roots yet, so the `pty_*` tools still need the extension entry loaded explicitly.
-
-### Enable the extension tools
-
-Load the extension entry from your cloned or installed plugin root:
-
-```sh
-omp --extension /path/to/omp-pty/index.ts
+```text
+~/.omp/agent/extensions/omp-pty/index.ts
 ```
 
-Or configure OMP to load the extension entry:
-
-```yaml
-extensions:
-  - /path/to/omp-pty/index.ts
-```
+This is the supported installation path for `omp-pty`. Marketplace and npm plugin installation are not used for this extension.
 
 ## Usage
 

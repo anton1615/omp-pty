@@ -2,9 +2,10 @@ import type { PTYSession, ReadResult, SearchResult } from "./types";
 
 export class OutputManager {
 	write(session: PTYSession, data: string): boolean {
+		if (session.status !== "running") return false;
 		try {
 			session.process?.write(data);
-			return session.status === "running";
+			return true;
 		} catch {
 			return false;
 		}

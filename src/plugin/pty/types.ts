@@ -59,6 +59,7 @@ export interface PTYSessionInfo {
 	exitSignal?: string | number;
 	pid: number;
 	createdAt: string;
+	parentSessionId?: string;
 	lineCount: number;
 }
 

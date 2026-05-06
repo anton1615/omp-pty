@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { RingBuffer } from "./src/plugin/pty/buffer";
 import { PTYManager } from "./src/plugin/pty/manager";
-import type { ManagedPTYProcess, PTYProcessSpawner } from "./src/plugin/pty/types";
-import { createOmpPtyExtension } from "./src/omp/extension";
+import type { ManagedPTYProcess, PTYProcessSpawner, PTYSession } from "./src/plugin/pty/types";
+import { formatExitNotification } from "./src/plugin/pty/notification-manager";
+import defaultOmpPtyExtension, { createOmpPtyExtension } from "./src/omp/extension";
 
 class FakeProcess implements ManagedPTYProcess {
 	pid: number;
@@ -44,6 +45,48 @@ class FakeProcess implements ManagedPTYProcess {
 		this.closed = true;
 		this.subscriptionsClosed = true;
 	}
+}
+
+type RegisteredTool = { execute: Function };
+type RegisteredEventHandler = (event: unknown, ctx: ReturnType<typeof createToolContext>) => unknown;
+
+function createToolContext(sessionId = "session-main", cwd = "C:/work/project") {
+	return {
+		cwd,
+		hasUI: false,
+		ui: { notify: () => undefined },
+		sessionManager: { getSessionId: () => sessionId },
+	};
+}
+
+function createExtensionHarness(extensionOrManager: PTYManager | ((pi: any) => void)) {
+	const tools = new Map<string, RegisteredTool>();
+	const messages: Array<{ content: string; options: unknown }> = [];
+	const events = new Map<string, RegisteredEventHandler[]>();
+	const Type = {
+		Object: (properties: Record<string, unknown>) => ({ type: "object", properties }),
+		String: (options?: Record<string, unknown>) => ({ type: "string", options }),
+		Number: (options?: Record<string, unknown>) => ({ type: "number", options }),
+		Boolean: (options?: Record<string, unknown>) => ({ type: "boolean", options }),
+		Array: (item: unknown, options?: Record<string, unknown>) => ({ type: "array", item, options }),
+		Record: (key: unknown, value: unknown, options?: Record<string, unknown>) => ({ type: "record", key, value, options }),
+		Optional: (schema: unknown) => ({ optional: true, schema }),
+	};
+
+	const extension = extensionOrManager instanceof PTYManager ? createOmpPtyExtension(extensionOrManager) : extensionOrManager;
+	extension({
+		typebox: { Type },
+		registerTool: tool => tools.set(tool.name, tool),
+		registerCommand: () => undefined,
+		on: (eventName, handler) => {
+			const handlers = events.get(eventName) ?? [];
+			handlers.push(handler as RegisteredEventHandler);
+			events.set(eventName, handlers);
+		},
+		sendMessage: (message, options) => messages.push({ content: message.content, options }),
+	});
+
+	return { tools, messages, events };
 }
 
 describe("upstream-port architecture", () => {
@@ -107,6 +150,24 @@ describe("RingBuffer", () => {
 		expect(buffer.byteLength).toBe(8192);
 		expect(buffer.readRaw()).toBe("x".repeat(8192));
 		expect(elapsedMs).toBeLessThan(120);
+	});
+
+	it("reports regex search matches with one-based line numbers", () => {
+		const buffer = new RingBuffer(1024);
+
+		buffer.append("alpha\nbeta\n");
+
+		expect(buffer.search(/beta/)).toEqual([{ lineNumber: 2, text: "beta" }]);
+	});
+
+	it("tracks line count and the last non-empty line without notification-time full reads", () => {
+		const buffer = new RingBuffer(1024);
+
+		buffer.append("first\n");
+		buffer.append("last useful\n\n\n");
+
+		expect(buffer.getLineCount()).toBe(4);
+		expect(buffer.getLastNonEmptyLine()).toBe("last useful");
 	});
 });
 
@@ -172,6 +233,7 @@ describe("PTYManager", () => {
 			notifyOnExit: true,
 		});
 
+		spawned[0].emit("starting\nready\n");
 		spawned[0].exit(0);
 
 		expect(manager.get(info.id)).toEqual(expect.objectContaining({ status: "exited", exitCode: 0 }));
@@ -179,15 +241,52 @@ describe("PTYManager", () => {
 			[
 				"<pty_exited>",
 				`ID: ${info.id}`,
-				"Title: npm run dev",
-				"Command: npm run dev",
-				"Workdir: C:/work/project",
-				"ExitCode: 0",
-				"Signal: none",
-				"TimedOut: false",
+				"Description: Run dev server",
+				"Exit Code: 0",
+				"TimeoutSeconds: none",
+				"Timed Out: no",
+				"Output Lines: 2",
+				"Last Line: ready",
 				"</pty_exited>",
+				"",
+				"Use pty_read to check the full output.",
 			].join("\n"),
 		]);
+	});
+
+	it("finds the last notification line without reading the full buffer", () => {
+		const session = {
+			id: "pty_perf",
+			title: "notify perf",
+			command: "cmd.exe",
+			args: [],
+			workdir: "C:/work/project",
+			status: "exited",
+			exitCode: 0,
+			pid: 1234,
+			createdAt: new Date(),
+			notifyOnExit: true,
+			timedOut: false,
+			process: null,
+			buffer: {
+				get length() {
+					throw new Error("notification must use cached line count");
+				},
+				getLineCount: () => 201,
+				read: () => {
+					throw new Error("notification must not read the full buffer");
+				},
+				getLastNonEmptyLine: () => "last useful",
+				readRaw: () => "last useful\n\n",
+				search: () => [],
+				byteLength: "last useful\n\n".length,
+				append: () => undefined,
+				flush: () => undefined,
+				clear: () => undefined,
+			},
+		} as unknown as PTYSession;
+
+		expect(formatExitNotification(session)).toContain("Last Line: last useful");
 	});
 
 	it("kills and removes sessions when cleanup is requested", () => {
@@ -219,7 +318,7 @@ describe("PTYManager", () => {
 		spawned[0].exit(null, "SIGTERM");
 
 		expect(manager.get(info.id)).toEqual(expect.objectContaining({ status: "killed", timedOut: true }));
-		expect(notifications[0]).toContain("TimedOut: true");
+		expect(notifications[0]).toContain("Timed Out: yes");
 	});
 
 	it("spawns a real shell PTY and captures output", async () => {
@@ -302,4 +401,168 @@ describe("opencodePtyExtension", () => {
 			}),
 		]);
 	});
+
+	it("parses literal escape sequences in pty_write before writing", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3100, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools } = createExtensionHarness(manager);
+		const spawnTool = tools.get("pty_spawn");
+		const writeTool = tools.get("pty_write");
+		expect(spawnTool).toBeDefined();
+		expect(writeTool).toBeDefined();
+
+		const spawnResult = await spawnTool!.execute(
+			"call-1",
+			{ command: "cmd.exe", args: [] },
+			undefined,
+			undefined,
+			{ cwd: "C:/work/project", hasUI: false, ui: { notify: () => undefined } },
+		);
+		const id = spawnResult.details.id;
+
+		const writeResult = await writeTool!.execute("call-2", { id, data: "first\\n\\x03\\u0041\\\\" });
+
+		expect(writeResult.isError).toBeUndefined();
+		expect(spawned[0].writes).toEqual([`first\n${String.fromCharCode(3)}A\\`]);
+		expect(writeResult.content[0].text).toContain("^C");
+	});
+
+	it("does not write to exited PTY sessions", () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3200, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const info = manager.spawn({ command: "node", args: [], workdir: "C:/work/project" });
+
+		spawned[0].exit(0);
+
+		expect(manager.write(info.id, "after exit\n")).toBe(false);
+		expect(spawned[0].writes).toEqual([]);
+	});
+
+	it("formats pty_read with upstream defaults and case-sensitive regex by default", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3300, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools } = createExtensionHarness(manager);
+		const spawnResult = await tools.get("pty_spawn")!.execute(
+			"call-1",
+			{ command: "node", args: [] },
+			undefined,
+			undefined,
+			{ cwd: "C:/work/project", hasUI: false, ui: { notify: () => undefined } },
+		);
+		const id = spawnResult.details.id;
+		spawned[0].emit(`${Array.from({ length: 501 }, (_, index) => `line ${index + 1}`).join("\n")}\nERROR upper\n`);
+
+		const plainResult = await tools.get("pty_read")!.execute("call-2", { id });
+		const plainText = plainResult.content[0].text;
+
+		expect(plainText).toContain(`<pty_output id="${id}" status="running">`);
+		expect(plainText.match(/^\d{5}\|/gm)).toHaveLength(500);
+		expect(plainText).toContain("00001| line 1");
+		expect(plainText).not.toContain("00501| line 501");
+		expect(plainText).toContain("Use offset=500");
+
+		const caseSensitiveResult = await tools.get("pty_read")!.execute("call-3", { id, pattern: "error" });
+		expect(caseSensitiveResult.content[0].text).toContain("No lines matched the pattern 'error'.");
+
+		const ignoreCaseResult = await tools.get("pty_read")!.execute("call-4", { id, pattern: "error", ignoreCase: true });
+		expect(ignoreCaseResult.content[0].text).toContain("00502| ERROR upper");
+
+		const dangerousRegexResult = await tools.get("pty_read")!.execute("call-5", { id, pattern: "(a+)+$" });
+		expect(dangerousRegexResult.isError).toBe(true);
+		expect(dangerousRegexResult.content[0].text).toContain("Potentially dangerous regex pattern rejected");
+
+		const outOfRangeResult = await tools.get("pty_read")!.execute("call-6", { id, offset: 999, limit: 10 });
+		expect(outOfRangeResult.content[0].text).toContain("Offset 999 is beyond available output");
+	});
 });
+
+	it("scopes PTY tools to the current OMP session by default", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3400, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools } = createExtensionHarness(manager);
+		const sessionA = createToolContext("session-a");
+		const sessionB = createToolContext("session-b");
+
+		const spawnResult = await tools.get("pty_spawn")!.execute("call-1", { command: "node", args: [] }, undefined, undefined, sessionA);
+		const id = spawnResult.details.id;
+		spawned[0].emit("session a output\n");
+
+		expect((await tools.get("pty_list")!.execute("call-2", {}, undefined, undefined, sessionA)).content[0].text).toContain(id);
+		expect((await tools.get("pty_list")!.execute("call-3", {}, undefined, undefined, sessionB)).content[0].text).not.toContain(id);
+		expect((await tools.get("pty_list")!.execute("call-4", { all: true }, undefined, undefined, sessionB)).content[0].text).toContain(id);
+
+		const crossRead = await tools.get("pty_read")!.execute("call-5", { id }, undefined, undefined, sessionB);
+		expect(crossRead.isError).toBe(true);
+		expect(crossRead.content[0].text).toContain("current OMP session");
+
+		const crossWrite = await tools.get("pty_write")!.execute("call-6", { id, data: "oops\n" }, undefined, undefined, sessionB);
+		expect(crossWrite.isError).toBe(true);
+		expect(spawned[0].writes).toEqual([]);
+
+		const crossKill = await tools.get("pty_kill")!.execute("call-7", { id, cleanup: true }, undefined, undefined, sessionB);
+		expect(crossKill.isError).toBe(true);
+		expect(spawned[0].killed).toBe(false);
+	});
+
+	it("cleans up current-session PTYs after a confirmed session switch", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3500, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools, events } = createExtensionHarness(manager);
+		const sessionA = createToolContext("session-a");
+		const sessionB = createToolContext("session-b");
+
+		await tools.get("pty_spawn")!.execute("call-1", { command: "node", args: [] }, undefined, undefined, sessionA);
+		expect(manager.list()).toHaveLength(1);
+
+		await events.get("session_before_switch")![0]({ type: "session_before_switch", reason: "new" }, sessionA);
+		expect(manager.list()).toHaveLength(1);
+
+		await events.get("session_switch")![0]({ type: "session_switch", reason: "new", previousSessionFile: "old.json" }, sessionB);
+		expect(spawned[0].killed).toBe(true);
+		expect(manager.list()).toHaveLength(0);
+	});
+
+	it("creates a fresh PTY manager for each default extension registration", async () => {
+		const first = createExtensionHarness(defaultOmpPtyExtension);
+		const second = createExtensionHarness(defaultOmpPtyExtension);
+		const isWindows = process.platform === "win32";
+		const spawnResult = await first.tools.get("pty_spawn")!.execute(
+			"call-1",
+			{
+				command: isWindows ? "cmd.exe" : "sh",
+				args: isWindows ? ["/c", "echo default-manager-isolation"] : ["-lc", "echo default-manager-isolation"],
+			},
+			undefined,
+			undefined,
+			createToolContext("session-a", process.cwd()),
+		);
+		const id = spawnResult.details.id;
+
+		expect((await second.tools.get("pty_list")!.execute("call-2", { all: true }, undefined, undefined, createToolContext("session-a", process.cwd()))).content[0].text).not.toContain(id);
+		await first.tools.get("pty_kill")!.execute("call-3", { id, cleanup: true }, undefined, undefined, createToolContext("session-a", process.cwd()));
+	});

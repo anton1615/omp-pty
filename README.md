@@ -11,15 +11,17 @@ Tools:
 - `pty_spawn` — start a persistent PTY session.
 - `pty_read` — read buffered output with pagination or regex filtering.
 - `pty_write` — send input to a running session.
-- `pty_list` — list sessions, status, PIDs, line counts, exits, and timeouts.
+- `pty_list` — list current OMP session PTYs by default, or all PTYs in this process with `all: true`.
 - `pty_kill` — terminate a session and optionally remove its buffered output.
 
 Commands:
 
-- `/pty-list` — show active PTY sessions.
-- `/pty-kill-all` — terminate and clean up every session owned by the extension.
+- `/pty-list` — show active PTY sessions for the current OMP session.
+- `/pty-kill-all` — terminate and clean up every PTY owned by the current OMP session.
 
 Use this extension for long-running servers, watchers, REPLs, database CLIs, shells, and other commands that need a real terminal or later input. Keep using the normal `bash` tool for short one-shot commands.
+
+PTY sessions are scoped to the current OMP conversation session by default. `pty_read`, `pty_write`, and `pty_kill` reject PTY IDs from other OMP sessions in the same process; `pty_list` shows only the current session unless `all: true` is passed. On a confirmed OMP session switch, PTYs from the previous session are cleaned up. Separate OMP windows normally run in separate OS processes and therefore have independent PTY managers.
 
 ## Install
 
@@ -70,6 +72,17 @@ pty_read:
   limit: 40
 ```
 
+`pty_read` defaults to 500 lines or matches when `limit` is omitted. Regex `pattern` matching is case-sensitive by default; pass `ignoreCase: true` when you want case-insensitive matching. Output lines are numbered and truncated to keep tool results bounded.
+List sessions:
+
+```text
+pty_list:
+  all: false
+```
+
+Use `all: true` only when you need to inspect every PTY owned by this OMP process across conversation sessions.
+
+
 Send input to an interactive process:
 
 ```text
@@ -77,6 +90,8 @@ pty_write:
   id: pty_...
   data: "help\n"
 ```
+
+`pty_write` parses literal escape sequences before writing: `\n`, `\r`, `\t`, `\xNN`, `\uNNNN`, and `\\`. Send `"\x03"` for Ctrl-C.
 
 Clean up when done:
 
@@ -93,13 +108,15 @@ When `notifyOnExit: true`, the extension injects a future message after the proc
 ```xml
 <pty_exited>
 ID: pty_...
-Title: ...
-Command: ...
-Workdir: ...
-ExitCode: 0
-Signal: none
-TimedOut: false
+Description: ...
+Exit Code: 0
+TimeoutSeconds: none
+Timed Out: no
+Output Lines: 12
+Last Line: ready
 </pty_exited>
+
+Use pty_read to check the full output.
 ```
 
 If all you need is completion, wait for `<pty_exited>` instead of polling output with sleep loops. If the exit is non-zero or timed out, read buffered output before cleanup.

@@ -33,6 +33,10 @@ type TypeFactory = {
 	Optional(schema: unknown): unknown;
 };
 
+type SessionManagerContext = {
+	getSessionId(): string;
+};
+
 type ExtensionAPI = {
 	typebox: { Type: TypeFactory } | TypeFactory;
 	registerTool(tool: ToolDefinition): void;
@@ -52,6 +56,7 @@ type ExtensionContext = {
 	cwd: string;
 	hasUI: boolean;
 	ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
+	sessionManager?: SessionManagerContext;
 };
 
 const EXTENSION_ID = "omp-pty";
@@ -63,6 +68,11 @@ const NOTIFY_ON_EXIT_INSTRUCTIONS = [
 	"Call `pty_read` before exit only if you need live output now, the user explicitly asks for logs, or the exit notification reports a non-zero status and you need to investigate.",
 	"</system_reminder>",
 ].join("\n");
+const DEFAULT_READ_LIMIT = 500;
+const MAX_LINE_LENGTH = 2000;
+const ETX = String.fromCharCode(3);
+const EOT = String.fromCharCode(4);
+
 
 function resolveTypeFactory(pi: ExtensionAPI): TypeFactory {
 	const maybeNested = pi.typebox as { Type?: TypeFactory };
@@ -124,6 +134,31 @@ function formatList(sessions: PTYSessionInfo[]): string {
 	return sessions.map(formatSessionSummary).join("\n\n");
 }
 
+function currentSessionId(ctx: ExtensionContext | undefined): string {
+	return ctx?.sessionManager?.getSessionId() || "default";
+}
+
+function sessionBelongsTo(info: PTYSessionInfo, sessionId: string): boolean {
+	return info.parentSessionId === undefined || info.parentSessionId === sessionId;
+}
+
+function currentSessionSessions(manager: PTYManager, ctx: ExtensionContext | undefined, includeAll = false): PTYSessionInfo[] {
+	const sessions = manager.list();
+	if (includeAll) return sessions;
+	const sessionId = currentSessionId(ctx);
+	return sessions.filter(session => sessionBelongsTo(session, sessionId));
+}
+
+function getCurrentSession(manager: PTYManager, id: string, ctx: ExtensionContext | undefined): PTYSessionInfo | null {
+	const session = manager.get(id);
+	if (!session || !sessionBelongsTo(session, currentSessionId(ctx))) return null;
+	return session;
+}
+
+function currentSessionNotFound(id: string): string {
+	return `PTY session not found in current OMP session: ${id}`;
+}
+
 function formatSpawned(info: PTYSessionInfo): string {
 	return [
 		"<pty_spawned>",
@@ -140,33 +175,150 @@ function formatSpawned(info: PTYSessionInfo): string {
 	].join("\n");
 }
 
-function formatReadResult(result: ReadResult): string {
+function formatLine(line: string, lineNumber: number, maxLength = MAX_LINE_LENGTH): string {
+	const lineNumberText = lineNumber.toString().padStart(5, "0");
+	const truncatedLine = line.length > maxLength ? `${line.slice(0, maxLength)}...` : line;
+	return `${lineNumberText}| ${truncatedLine}`;
+}
+
+function buildTimeoutReminder(session: PTYSessionInfo): string {
 	return [
-		"<pty_output>",
-		`Offset: ${result.offset}`,
-		`TotalLines: ${result.totalLines}`,
-		`HasMore: ${result.hasMore}`,
-		"---",
-		...result.lines,
+		"<system_reminder>",
+		`This session was auto-killed after reaching \`timeoutSeconds=${session.timeoutSeconds ?? "unknown"}\`.`,
+		"Use `pty_read` to inspect the final output or `pty_list` to review other sessions.",
+		"</system_reminder>",
+	].join("\n");
+}
+
+function appendSessionReminders(output: string, session: PTYSessionInfo): string {
+	let result = output;
+	if (session.notifyOnExit && session.status === "running") {
+		result = `${result}\n\n${NOTIFY_ON_EXIT_INSTRUCTIONS}`;
+	}
+	if (session.timedOut) {
+		result = `${result}\n\n${buildTimeoutReminder(session)}`;
+	}
+	return result;
+}
+
+function formatPtyOutput(
+	id: string,
+	status: string,
+	pattern: string | undefined,
+	formattedLines: string[],
+	hasMore: boolean,
+	paginationMessage: string,
+	endMessage: string,
+): string {
+	return [
+		`<pty_output id="${id}" status="${status}"${pattern ? ` pattern="${pattern}"` : ""}>`,
+		...formattedLines,
+		"",
+		hasMore ? paginationMessage : endMessage,
 		"</pty_output>",
 	].join("\n");
 }
 
-function formatSearchResult(result: SearchResult): string {
-	return [
-		"<pty_matches>",
-		`Offset: ${result.offset}`,
-		`TotalMatches: ${result.totalMatches}`,
-		`TotalLines: ${result.totalLines}`,
-		`HasMore: ${result.hasMore}`,
-		"---",
-		...result.matches.map(match => `${match.lineNumber}: ${match.text}`),
-		"</pty_matches>",
-	].join("\n");
+function formatReadResult(id: string, session: PTYSessionInfo, result: ReadResult): string {
+	if (result.lines.length === 0) {
+		return appendSessionReminders(
+			[
+				`<pty_output id="${id}" status="${session.status}">`,
+				result.totalLines === 0
+					? "(No output available - buffer is empty)"
+					: `Offset ${result.offset} is beyond available output (${result.totalLines} total lines).`,
+				`Total lines: ${result.totalLines}`,
+				"</pty_output>",
+			].join("\n"),
+			session,
+		);
+	}
+
+	const formattedLines = result.lines.map((line, index) => formatLine(line, result.offset + index + 1));
+	const paginationMessage = `(Buffer has more lines. Use offset=${result.offset + result.lines.length} to read beyond line ${result.offset + result.lines.length})`;
+	const endMessage = `(End of buffer - total ${result.totalLines} lines)`;
+	return appendSessionReminders(
+		formatPtyOutput(id, session.status, undefined, formattedLines, result.hasMore, paginationMessage, endMessage),
+		session,
+	);
 }
 
-function compilePattern(pattern: string): RegExp {
-	return new RegExp(pattern, "i");
+function formatSearchResult(id: string, pattern: string, session: PTYSessionInfo, result: SearchResult): string {
+	if (result.matches.length === 0) {
+		return appendSessionReminders(
+			[
+				`<pty_output id="${id}" status="${session.status}" pattern="${pattern}">`,
+				`No lines matched the pattern '${pattern}'.`,
+				`Total lines in buffer: ${result.totalLines}`,
+				"</pty_output>",
+			].join("\n"),
+			session,
+		);
+	}
+
+	const formattedLines = result.matches.map(match => formatLine(match.text, match.lineNumber));
+	const paginationMessage = `(${result.matches.length} of ${result.totalMatches} matches shown. Use offset=${result.offset + result.matches.length} to see more.)`;
+	const endMessage = `(${result.totalMatches} match${result.totalMatches === 1 ? "" : "es"} from ${result.totalLines} total lines)`;
+	return appendSessionReminders(
+		formatPtyOutput(id, session.status, pattern, formattedLines, result.hasMore, paginationMessage, endMessage),
+		session,
+	);
+}
+
+function validateRegex(pattern: string): boolean {
+	try {
+		new RegExp(pattern);
+		const dangerousPatterns = [
+			/\([^)]*[+*][^)]*\)[+*?{]/,
+			/\([^)]*\{[^)]*\}[^)]*\)[+*?{]/,
+			/\(\?:.*\)\*.*\(\?:.*\)\*/,
+			/.*\(\.\*\?\)\{2,\}.*/,
+			/.*\(.*\|.*\)\{3,\}.*/,
+		];
+		return !dangerousPatterns.some(dangerous => dangerous.test(pattern));
+	} catch {
+		return false;
+	}
+}
+
+function compilePattern(pattern: string, ignoreCase?: boolean): RegExp {
+	if (!validateRegex(pattern)) {
+		throw new Error(`Potentially dangerous regex pattern rejected: '${pattern}'. Please use a safer pattern.`);
+	}
+	try {
+		return new RegExp(pattern, ignoreCase ? "i" : "");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`Invalid regex pattern '${pattern}': ${message}`);
+	}
+}
+
+function parseEscapeSequences(input: string): string {
+	return input.replace(/\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|[nrt\\])/g, (match, seq: string) => {
+		if (seq.startsWith("x")) return String.fromCharCode(Number.parseInt(seq.slice(1), 16));
+		if (seq.startsWith("u")) return String.fromCharCode(Number.parseInt(seq.slice(1), 16));
+		switch (seq) {
+			case "n":
+				return "\n";
+			case "r":
+				return "\r";
+			case "t":
+				return "\t";
+			case "\\":
+				return "\\";
+			default:
+				return match;
+		}
+	});
+}
+
+function formatWritePreview(data: string): string {
+	const preview = data.length > 50 ? `${data.slice(0, 50)}...` : data;
+	return preview
+		.replace(new RegExp(ETX, "g"), "^C")
+		.replace(new RegExp(EOT, "g"), "^D")
+		.replace(/\n/g, "\\n")
+		.replace(/\r/g, "\\r");
 }
 
 export function createOmpPtyExtension(manager = new PTYManager()): (pi: ExtensionAPI) => void {
@@ -182,6 +334,7 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 
 		const runtimeManager = manager;
 		runtimeManager.setNotifier(notify);
+		let switchingFromSessionId: string | undefined;
 
 		pi.registerTool({
 			name: "pty_spawn",
@@ -211,10 +364,11 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 				const info = runtimeManager.spawn({
 					command,
 					args: asStringArray(params.args) ?? [],
-					workdir: asString(params.workdir) ?? ctx.cwd,
+					workdir: asString(params.workdir) ?? ctx?.cwd ?? process.cwd(),
 					env: asStringRecord(params.env),
 					title: asString(params.title),
 					description: asString(params.description),
+					parentSessionId: currentSessionId(ctx),
 					notifyOnExit: asBoolean(params.notifyOnExit),
 					timeoutSeconds: asNumber(params.timeoutSeconds),
 				});
@@ -231,12 +385,23 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 				id: Type.String({ description: "PTY session ID" }),
 				data: Type.String({ description: "Text or escape sequence to write" }),
 			}),
-			execute: async (_toolCallId, params) => {
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 				const id = asString(params.id);
 				const data = asString(params.data);
 				if (!id || data === undefined) return textResult("pty_write requires id and data.", {}, true);
-				const ok = runtimeManager.write(id, data);
-				return textResult(ok ? `Wrote ${data.length} characters to ${id}.` : `PTY session not running: ${id}`, { id, ok }, !ok);
+				const session = getCurrentSession(runtimeManager, id, ctx);
+				if (!session) return textResult(currentSessionNotFound(id), { id }, true);
+				if (session.status !== "running") {
+					return textResult(`Cannot write to PTY '${id}' - session status is '${session.status}'.`, { id, status: session.status }, true);
+				}
+				const parsedData = parseEscapeSequences(data);
+				const ok = runtimeManager.write(id, parsedData);
+				const preview = formatWritePreview(parsedData);
+				return textResult(
+					ok ? `Sent ${parsedData.length} characters to ${id}: "${preview}"` : `Failed to write to PTY '${id}'.`,
+					{ id, ok },
+					!ok,
+				);
 			},
 		});
 
@@ -248,25 +413,29 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 				id: Type.String({ description: "PTY session ID" }),
 				offset: Type.Optional(Type.Number({ description: "Zero-based line or match offset" })),
 				limit: Type.Optional(Type.Number({ description: "Maximum number of lines or matches to return" })),
-				pattern: Type.Optional(Type.String({ description: "Optional case-insensitive regex filter" })),
+				pattern: Type.Optional(Type.String({ description: "Optional regex filter. Matching is case-sensitive unless ignoreCase=true" })),
+				ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive pattern matching; defaults to false" })),
 			}),
-			execute: async (_toolCallId, params) => {
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 				const id = asString(params.id);
 				if (!id) return textResult("pty_read requires id.", {}, true);
 				const offset = asNumber(params.offset) ?? 0;
-				const limit = asNumber(params.limit);
+				const limit = asNumber(params.limit) ?? DEFAULT_READ_LIMIT;
 				const pattern = asString(params.pattern);
+				const ignoreCase = asBoolean(params.ignoreCase) ?? false;
+				const session = getCurrentSession(runtimeManager, id, ctx);
+				if (!session) return textResult(currentSessionNotFound(id), { id }, true);
 
 				try {
 					if (pattern) {
-						const result = runtimeManager.search(id, compilePattern(pattern), offset, limit);
+						const result = runtimeManager.search(id, compilePattern(pattern, ignoreCase), offset, limit);
 						if (!result) return textResult(`PTY session not found: ${id}`, { id }, true);
-						return textResult(formatSearchResult(result), { id, ...result });
+						return textResult(formatSearchResult(id, pattern, session, result), { id, ...result });
 					}
 
 					const result = runtimeManager.read(id, offset, limit);
 					if (!result) return textResult(`PTY session not found: ${id}`, { id }, true);
-					return textResult(formatReadResult(result), { id, ...result });
+					return textResult(formatReadResult(id, session, result), { id, ...result });
 				} catch (error) {
 					return textResult(error instanceof Error ? error.message : String(error), { id }, true);
 				}
@@ -277,9 +446,11 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 			name: "pty_list",
 			label: "PTY List",
 			description: "List all PTY sessions with status, PID, command, and buffered line count.",
-			parameters: Type.Object({}),
-			execute: async () => {
-				const sessions = runtimeManager.list();
+			parameters: Type.Object({
+				all: Type.Optional(Type.Boolean({ description: "Include PTY sessions from every OMP session in this process" })),
+			}),
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+				const sessions = currentSessionSessions(runtimeManager, ctx, asBoolean(params.all) ?? false);
 				return textResult(formatList(sessions), { sessions });
 			},
 		});
@@ -292,10 +463,12 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 				id: Type.String({ description: "PTY session ID" }),
 				cleanup: Type.Optional(Type.Boolean({ description: "Remove session metadata and buffer after killing" })),
 			}),
-			execute: async (_toolCallId, params) => {
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 				const id = asString(params.id);
 				if (!id) return textResult("pty_kill requires id.", {}, true);
 				const cleanup = asBoolean(params.cleanup) ?? false;
+				const session = getCurrentSession(runtimeManager, id, ctx);
+				if (!session) return textResult(currentSessionNotFound(id), { id }, true);
 				const ok = runtimeManager.kill(id, cleanup);
 				return textResult(ok ? `Killed PTY session ${id}.` : `PTY session not found: ${id}`, { id, cleanup, ok }, !ok);
 			},
@@ -304,7 +477,7 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 		pi.registerCommand("pty-list", {
 			description: "List active PTY sessions",
 			handler: async (_args, ctx) => {
-				pi.sendMessage({ customType: EXTENSION_ID, content: formatList(runtimeManager.list()), display: true });
+				pi.sendMessage({ customType: EXTENSION_ID, content: formatList(currentSessionSessions(runtimeManager, ctx)), display: true });
 				if (ctx.hasUI) ctx.ui.notify("PTY sessions listed.", "info");
 			},
 		});
@@ -312,12 +485,22 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 		pi.registerCommand("pty-kill-all", {
 			description: "Kill and clean up all PTY sessions",
 			handler: async (_args, ctx) => {
-				runtimeManager.clearAllSessions();
-				pi.sendMessage({ customType: EXTENSION_ID, content: "All PTY sessions killed.", display: true });
-				if (ctx.hasUI) ctx.ui.notify("All PTY sessions killed.", "info");
+				runtimeManager.cleanupBySession(currentSessionId(ctx));
+				pi.sendMessage({ customType: EXTENSION_ID, content: "Current OMP session PTY sessions killed.", display: true });
+				if (ctx.hasUI) ctx.ui.notify("Current OMP session PTY sessions killed.", "info");
 			},
 		});
 
+
+		pi.on("session_before_switch", (_event, ctx) => {
+			switchingFromSessionId = currentSessionId(ctx);
+		});
+
+		pi.on("session_switch", () => {
+			if (!switchingFromSessionId) return;
+			runtimeManager.cleanupBySession(switchingFromSessionId);
+			switchingFromSessionId = undefined;
+		});
 		pi.on("session_shutdown", () => {
 			runtimeManager.clearAllSessions();
 		});
@@ -325,4 +508,6 @@ export function createOmpPtyExtension(manager = new PTYManager()): (pi: Extensio
 }
 
 export const createOpenCodePtyExtension = createOmpPtyExtension;
-export default createOmpPtyExtension();
+export default function ompPtyExtension(pi: ExtensionAPI): void {
+	return createOmpPtyExtension(new PTYManager())(pi);
+}

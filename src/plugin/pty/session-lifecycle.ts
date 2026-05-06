@@ -201,6 +201,7 @@ export class SessionLifecycleManager {
 			exitCode: session.exitCode,
 			exitSignal: session.exitSignal,
 			pid: session.pid,
+			parentSessionId: session.parentSessionId,
 			createdAt: session.createdAt.toISOString(),
 			lineCount: session.buffer.length,
 		};

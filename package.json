@@ -12,6 +12,7 @@
     "index.ts",
     "src/**",
     ".claude-plugin/marketplace.json",
+    "skills/**",
     "README.md",
     "LICENSE"
   ],

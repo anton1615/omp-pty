@@ -23,21 +23,30 @@ Use this extension for long-running servers, watchers, REPLs, database CLIs, she
 
 ## Install
 
-### Marketplace catalog
-
-This repo includes `.claude-plugin/marketplace.json` so it can be listed as an OMP/Claude-style marketplace plugin. Current OMP marketplace install caches plugin roots for skills, commands, hooks, custom tools, and MCP servers; it does not activate extension modules from marketplace-installed roots. Use the explicit extension path or config entry below to load the PTY tools until OMP supports marketplace-loaded extension modules.
-
-### Explicit extension path
+### Marketplace install
 
 ```sh
-omp --extension C:/Users/Anton/.omp/agent/extensions/omp-pty/index.ts
+omp plugin marketplace add anton1615/omp-pty
+omp plugin install omp-pty@omp-pty
 ```
 
-In config, point OMP at the extension entry:
+Marketplace installation makes the plugin root discoverable to OMP and loads bundled skills from `skills/*/SKILL.md` on the next session/reload. The bundled PTY skill is exposed as `omp-pty:using-omp-pty`.
+
+Current OMP marketplace loading does not activate extension modules from marketplace-installed roots yet, so the `pty_*` tools still need the extension entry loaded explicitly.
+
+### Enable the extension tools
+
+Load the extension entry from your cloned or installed plugin root:
+
+```sh
+omp --extension /path/to/omp-pty/index.ts
+```
+
+Or configure OMP to load the extension entry:
 
 ```yaml
 extensions:
-  - C:/Users/Anton/.omp/agent/extensions/omp-pty/index.ts
+  - /path/to/omp-pty/index.ts
 ```
 
 ## Usage

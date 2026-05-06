@@ -37,13 +37,15 @@ Unix-like shells:
 git clone git@github.com:anton1615/omp-pty.git ~/.omp/agent/extensions/omp-pty
 ```
 
-Then restart or reload OMP. The expected extension entry is:
+Then restart or reload OMP. OMP should discover this extension entry automatically:
 
 ```text
 ~/.omp/agent/extensions/omp-pty/index.ts
 ```
 
 This is the supported installation path for `omp-pty`. Marketplace and npm plugin installation are not used for this extension.
+
+If you also want agent-side usage guidance, keep or install the separate user skill at `~/.omp/agent/skills/using-omp-pty/SKILL.md`. The skill is intentionally not bundled in this repo because OMP does not load skills from native extension directories.
 
 ## Usage
 
@@ -53,7 +55,7 @@ Start a session:
 pty_spawn:
   command: cmd.exe
   args: ["/c", "echo OMP_PTY_TOOL_OK"]
-  workdir: C:/Users/Anton/.omp
+  workdir: /path/to/project
   title: smoke check
   description: verify omp-pty is loaded
   notifyOnExit: true

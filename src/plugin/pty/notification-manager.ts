@@ -8,7 +8,7 @@ function truncate(text: string, maxLength: number): string {
 }
 
 function findLastNonEmptyLine(session: PTYSession): string {
-	return truncate(session.buffer.getLastNonEmptyLine(), NOTIFICATION_LINE_TRUNCATE);
+	return truncate(session.buffer.getLastDisplayLine(), NOTIFICATION_LINE_TRUNCATE);
 }
 
 export function formatExitNotification(session: PTYSession): string {

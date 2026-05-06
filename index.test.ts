@@ -108,6 +108,17 @@ describe("upstream-port architecture", () => {
 
 		const entry = await Bun.file("index.ts").text();
 		expect(entry.trim()).toBe('export { default, createOmpPtyExtension, createOpenCodePtyExtension } from "./src/omp/extension";');
+
+		const adapterSource = await Bun.file("src/omp/extension.ts").text();
+		for (const file of ["src/plugin/pty/formatters.ts", "src/plugin/pty/input.ts", "src/plugin/pty/permissions.ts", "src/plugin/pty/wildcard.ts"]) {
+			expect(await Bun.file(file).exists()).toBe(true);
+		}
+		expect(adapterSource).toContain("../plugin/pty/formatters");
+		expect(adapterSource).toContain("../plugin/pty/input");
+		expect(adapterSource).toContain("../plugin/pty/permissions");
+		expect(adapterSource).not.toContain("function formatReadResult");
+		expect(adapterSource).not.toContain("function parseEscapeSequences");
+		expect(adapterSource).not.toContain("function validateRegex");
 	});
 
 	it("keeps upstream bun-pty read-loop workaround in the spawner", async () => {
@@ -116,6 +127,9 @@ describe("upstream-port architecture", () => {
 		expect(spawnerSource).toContain("Terminal.prototype");
 		expect(spawnerSource).toContain("_startReadLoop");
 		expect(spawnerSource).toContain("await Promise.resolve()");
+		expect(spawnerSource).toContain("bun-pty/package.json");
+		expect(spawnerSource).toContain("0.4.8");
+		expect(spawnerSource).toContain("too new for patching");
 	});
 });
 
@@ -253,6 +267,46 @@ describe("PTYManager", () => {
 			].join("\n"),
 		]);
 	});
+	it("uses the last human-readable terminal line in exit notifications", () => {
+		const manager = new PTYManager({ spawner, notify: message => notifications.push(message) });
+		const info = manager.spawn({
+			command: "cmd.exe",
+			args: ["/c", "echo OMP_PTY_RESTART_OK"],
+			workdir: "C:/work/project",
+			description: "Restart smoke",
+			notifyOnExit: true,
+		});
+
+		spawned[0].emit("\x1b[2J\x1b[m\x1b[HOMP_PTY_RESTART_OK\n\x1b]0;C:\\Windows\\system32\\cmd.exe\x07\x1b[?25h\n");
+		spawned[0].exit(0);
+
+		expect(notifications[0]).toContain(`ID: ${info.id}`);
+		expect(notifications[0]).toContain("Last Line: OMP_PTY_RESTART_OK");
+		expect(notifications[0]).not.toContain("\x1b]");
+	});
+
+	it("ignores terminal controls split across data events in exit notifications", () => {
+		const manager = new PTYManager({ spawner, notify: message => notifications.push(message) });
+		const info = manager.spawn({
+			command: "cmd.exe",
+			args: ["/c", "echo OMP_PTY_RESTART_OK"],
+			workdir: "C:/work/project",
+			description: "Restart smoke",
+			notifyOnExit: true,
+		});
+
+		spawned[0].emit("OMP_PTY_RESTART_OK\n");
+		spawned[0].emit("\x1b]0;C:");
+		spawned[0].emit("\\Windows\\system32\\cmd.exe\x07");
+		spawned[0].emit("\x1b[?25");
+		spawned[0].emit("h\n");
+		spawned[0].exit(0);
+
+		expect(notifications[0]).toContain(`ID: ${info.id}`);
+		expect(notifications[0]).toContain("Last Line: OMP_PTY_RESTART_OK");
+		expect(notifications[0]).not.toContain("]0;C:");
+		expect(notifications[0]).not.toContain("[?25");
+	});
 
 	it("finds the last notification line without reading the full buffer", () => {
 		const session = {
@@ -277,6 +331,7 @@ describe("PTYManager", () => {
 					throw new Error("notification must not read the full buffer");
 				},
 				getLastNonEmptyLine: () => "last useful",
+				getLastDisplayLine: () => "last useful",
 				readRaw: () => "last useful\n\n",
 				search: () => [],
 				byteLength: "last useful\n\n".length,
@@ -491,6 +546,98 @@ describe("opencodePtyExtension", () => {
 	});
 });
 
+describe("OMP PTY permission and session policy", () => {
+	it("denies pty_spawn commands blocked by the OMP PTY permission policy", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3600, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools } = createExtensionHarness(createOmpPtyExtension(manager, { permissions: { bash: { npm: "deny" } } }));
+
+		const result = await tools.get("pty_spawn")!.execute("call-1", { command: "npm", args: ["run", "dev"] }, undefined, undefined, createToolContext());
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("explicitly denied");
+		expect(spawned).toHaveLength(0);
+	});
+
+	it("loads OMP PTY permission policy from environment by default", async () => {
+		const previous = process.env.OMP_PTY_PERMISSION_BASH;
+		process.env.OMP_PTY_PERMISSION_BASH = JSON.stringify({ npm: "deny" });
+		try {
+			const spawned: FakeProcess[] = [];
+			const spawner: PTYProcessSpawner = options => {
+				const process = new FakeProcess(3650, options.onData, options.onExit);
+				spawned.push(process);
+				return process;
+			};
+			const manager = new PTYManager({ spawner });
+			const { tools } = createExtensionHarness(createOmpPtyExtension(manager));
+
+			const result = await tools.get("pty_spawn")!.execute("call-1", { command: "npm", args: ["run", "dev"] }, undefined, undefined, createToolContext());
+
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toContain("explicitly denied");
+			expect(spawned).toHaveLength(0);
+		} finally {
+			if (previous === undefined) {
+				delete process.env.OMP_PTY_PERMISSION_BASH;
+			} else {
+				process.env.OMP_PTY_PERMISSION_BASH = previous;
+			}
+		}
+	});
+
+	it("denies pty_write commands blocked by the OMP PTY permission policy", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3700, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools } = createExtensionHarness(createOmpPtyExtension(manager, { permissions: { bash: { "rm *": "deny" } } }));
+		const spawnResult = await tools.get("pty_spawn")!.execute("call-1", { command: "sh", args: [] }, undefined, undefined, createToolContext());
+		const id = spawnResult.details.id;
+
+		const denied = await tools.get("pty_write")!.execute("call-2", { id, data: "rm -rf temp\n" }, undefined, undefined, createToolContext());
+		const prefixedDenied = await tools.get("pty_write")!.execute("call-3", { id, data: "\\x03rm -rf temp\n" }, undefined, undefined, createToolContext());
+		const interrupt = await tools.get("pty_write")!.execute("call-4", { id, data: "\\x03" }, undefined, undefined, createToolContext());
+
+		expect(denied.isError).toBe(true);
+		expect(prefixedDenied.isError).toBe(true);
+		expect(denied.content[0].text).toContain("explicitly denied");
+		expect(prefixedDenied.content[0].text).toContain("explicitly denied");
+		expect(interrupt.isError).toBeUndefined();
+		expect(spawned[0].writes).toEqual([String.fromCharCode(3)]);
+	});
+
+	it("denies pty_spawn workdirs outside cwd when external directory policy denies", async () => {
+		const spawned: FakeProcess[] = [];
+		const spawner: PTYProcessSpawner = options => {
+			const process = new FakeProcess(3800, options.onData, options.onExit);
+			spawned.push(process);
+			return process;
+		};
+		const manager = new PTYManager({ spawner });
+		const { tools } = createExtensionHarness(createOmpPtyExtension(manager, { permissions: { external_directory: "deny" } }));
+
+		const result = await tools.get("pty_spawn")!.execute(
+			"call-1",
+			{ command: "node", args: [], workdir: "/tmp/outside" },
+			undefined,
+			undefined,
+			createToolContext("session-main", "/repo/app"),
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("outside current OMP cwd");
+		expect(spawned).toHaveLength(0);
+	});
+
 	it("scopes PTY tools to the current OMP session by default", async () => {
 		const spawned: FakeProcess[] = [];
 		const spawner: PTYProcessSpawner = options => {
@@ -566,3 +713,4 @@ describe("opencodePtyExtension", () => {
 		expect((await second.tools.get("pty_list")!.execute("call-2", { all: true }, undefined, undefined, createToolContext("session-a", process.cwd()))).content[0].text).not.toContain(id);
 		await first.tools.get("pty_kill")!.execute("call-3", { id, cleanup: true }, undefined, undefined, createToolContext("session-a", process.cwd()));
 	});
+});

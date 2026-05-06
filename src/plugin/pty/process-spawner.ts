@@ -1,8 +1,14 @@
+import { semver } from "bun";
 import { spawn as spawnPty, Terminal, type IPty } from "bun-pty";
+import { version as bunPtyVersion } from "bun-pty/package.json";
 import type { ManagedPTYProcess, PTYProcessSpawnerOptions } from "./types";
 
 const DEFAULT_TERMINAL_COLS = 80;
 const DEFAULT_TERMINAL_ROWS = 24;
+
+if (semver.order(bunPtyVersion, "0.4.8") > 0) {
+	throw new Error(`bun-pty version ${bunPtyVersion} is too new for patching; remove the workaround.`);
+}
 
 const terminalPrototype = Terminal.prototype as unknown as {
 	_startReadLoop?: (...args: unknown[]) => unknown;

@@ -93,6 +93,21 @@ pty_write:
 
 `pty_write` parses literal escape sequences before writing: `\n`, `\r`, `\t`, `\xNN`, `\uNNNN`, and `\\`. Send `"\x03"` for Ctrl-C.
 
+## Permission policy
+
+`omp-pty` now keeps an upstream-shaped permission boundary for `pty_spawn` and command-like `pty_write` input. OMP extension tools do not expose an interactive approval API equivalent to OpenCode's `ask`, so `ask` is treated as denied.
+
+By default no PTY-specific policy is configured, matching upstream's allow-unless-configured behavior. To configure the default extension instance, set environment variables before OMP loads the extension:
+
+```sh
+OMP_PTY_PERMISSION_BASH='{"npm":"allow","rm *":"deny","sudo":"deny"}'
+OMP_PTY_PERMISSION_EXTERNAL_DIRECTORY=deny
+```
+
+`OMP_PTY_PERMISSION_BASH` accepts `allow`, `ask`, `deny`, or a JSON object whose keys are command patterns and whose values are `allow`, `ask`, or `deny`. `*` and `?` wildcards are supported. `OMP_PTY_PERMISSION_EXTERNAL_DIRECTORY=deny` rejects `pty_spawn.workdir` outside the current OMP cwd.
+
+Factory users can pass the same policy directly: `createOmpPtyExtension(manager, { permissions: { bash: { "rm *": "deny" }, external_directory: "deny" } })`.
+
 Clean up when done:
 
 ```text
@@ -155,10 +170,11 @@ bun run check
 
 The test suite covers:
 
-- upstream-shaped core file layout;
-- the `bun-pty` read-loop race workaround;
+- upstream-shaped core file layout and tool helpers;
+- the guarded `bun-pty` read-loop race workaround;
 - ring-buffer pagination, overflow, and large-chunk performance;
 - PTY manager spawn/read/write/list/kill behavior;
+- OMP permission policy enforcement for spawn/write/workdir;
 - `notifyOnExit` and timeout exit notifications;
 - real shell PTY smoke behavior;
 - OMP tool adapter registration and execution.
@@ -169,5 +185,6 @@ The test suite covers:
 - `src/omp/extension.ts` is the OMP adapter: tools, commands, lifecycle hooks, and OMP messages.
 - `src/plugin/pty/` contains the portable PTY core.
 - `src/pty-manager.ts` and `src/ring-buffer.ts` are compatibility re-export wrappers.
+- `src/plugin/pty/formatters.ts`, `input.ts`, `regex.ts`, `permissions.ts`, and `wildcard.ts` keep tool-level behavior upstream-shaped while `src/omp/extension.ts` only binds that behavior to OMP schemas/context.
 
 This split intentionally keeps OMP-specific code out of the PTY core so upstream changes can be manually diffed and ported with less churn.

@@ -35,6 +35,7 @@ export interface PTYSession {
 	exitSignal?: string | number;
 	pid: number;
 	createdAt: Date;
+	exitAt?: Date;
 	parentSessionId?: string;
 	parentAgent?: string;
 	notifyOnExit: boolean;
@@ -59,6 +60,7 @@ export interface PTYSessionInfo {
 	exitSignal?: string | number;
 	pid: number;
 	createdAt: string;
+	exitAt?: string;
 	parentSessionId?: string;
 	lineCount: number;
 }

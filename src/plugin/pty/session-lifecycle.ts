@@ -120,6 +120,9 @@ export class SessionLifecycleManager {
 				} else {
 					session.status = "exited";
 				}
+				// When the process stopped, so a reader can report how long it ran: the
+				// buffer keeps the output but nothing else records the end.
+				session.exitAt = new Date();
 				session.process?.close();
 				onExit(session, exitCode);
 			},
@@ -203,6 +206,7 @@ export class SessionLifecycleManager {
 			pid: session.pid,
 			parentSessionId: session.parentSessionId,
 			createdAt: session.createdAt.toISOString(),
+			exitAt: session.exitAt?.toISOString(),
 			lineCount: session.buffer.length,
 		};
 	}

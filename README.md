@@ -171,7 +171,7 @@ bun run check
 The test suite covers:
 
 - upstream-shaped core file layout and tool helpers;
-- the guarded `bun-pty` read-loop race workaround;
+- the obsoleted `bun-pty` read-loop monkey-patch staying removed (bun-pty `^0.4.10`);
 - ring-buffer pagination, overflow, and large-chunk performance;
 - PTY manager spawn/read/write/list/kill behavior;
 - OMP permission policy enforcement for spawn/write/workdir;

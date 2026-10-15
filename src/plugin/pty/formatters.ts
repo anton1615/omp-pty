@@ -28,6 +28,7 @@ export function formatSessionSummary(info: PTYSessionInfo): string {
 		`  TimedOut: ${info.timedOut}`,
 		`  ExitCode: ${info.exitCode ?? "none"}`,
 		`  Signal: ${info.exitSignal ?? "none"}`,
+		`  ExitAt: ${info.exitAt ?? "none"}`,
 	].join("\n");
 }
 

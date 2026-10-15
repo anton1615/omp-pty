@@ -42,7 +42,7 @@
     "typescript": "^5.9.2"
   },
   "dependencies": {
-    "bun-pty": "^0.4.8"
+    "bun-pty": "^0.4.10"
   },
   "omp": {
     "extensions": ["./index.ts"]

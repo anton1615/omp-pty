@@ -121,15 +121,12 @@ describe("upstream-port architecture", () => {
 		expect(adapterSource).not.toContain("function validateRegex");
 	});
 
-	it("keeps upstream bun-pty read-loop workaround in the spawner", async () => {
+	it("drops the obsoleted bun-pty read-loop workaround", async () => {
 		const spawnerSource = await Bun.file("src/plugin/pty/process-spawner.ts").text();
 
-		expect(spawnerSource).toContain("Terminal.prototype");
-		expect(spawnerSource).toContain("_startReadLoop");
-		expect(spawnerSource).toContain("await Promise.resolve()");
-		expect(spawnerSource).toContain("bun-pty/package.json");
-		expect(spawnerSource).toContain("0.4.8");
-		expect(spawnerSource).toContain("too new for patching");
+		expect(spawnerSource).not.toContain("Terminal.prototype");
+		expect(spawnerSource).not.toContain("_startReadLoop");
+		expect(spawnerSource).not.toContain("too new for patching");
 	});
 });
 
@@ -448,6 +445,7 @@ describe("opencodePtyExtension", () => {
 		expect(manager.list()[0]).toEqual(expect.objectContaining({ workdir: "C:/work/project", notifyOnExit: true }));
 
 		spawned[0].exit(0);
+		expect(manager.list()[0].exitAt).toBeTypeOf("string");
 
 		expect(messages).toEqual([
 			expect.objectContaining({
